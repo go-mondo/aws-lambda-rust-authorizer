@@ -25,6 +25,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Check release version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          npm_version="$(node -p 'require("./package.json").version')"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$TAG" != "v$npm_version" ] || [ "$TAG" != "v$cargo_version" ]; then
+            echo "::error::Release $TAG doesn't match package.json ($npm_version) and Cargo.toml ($cargo_version)"
+            exit 1
+          fi
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -46,6 +57,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # Runs `pnpm check` (prepublishOnly) and `pnpm build` (prepack) before publishing.
+      # Authenticates through npm trusted publishing (OIDC, no npm token), which this workflow
+      # file and the `npm` environment must be registered for, and needs npm 11.5.1 or later
+      # (Node.js 24 ships it). Runs `pnpm check` (prepublishOnly) and `pnpm build` (prepack) first.
       - name: Publish to npm
         run: npm publish
