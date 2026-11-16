@@ -55,6 +55,21 @@ async fn verifies_rs256_tokens() {
 }
 
 #[tokio::test]
+async fn uses_a_default_principal_without_sub() {
+    let idp = Idp::start().await;
+    let mut claims = idp.claims(json!({}));
+    claims.as_object_mut().unwrap().remove("sub");
+
+    let response = Authorizer::new(idp.config())
+        .authorize(&event(&sign(&claims, "test-key")))
+        .await
+        .unwrap();
+
+    assert_eq!(response.principal_id, "mondo-user");
+    assert!(!response.context.contains_key("userId"));
+}
+
+#[tokio::test]
 async fn caches_discovery_across_invocations() {
     let idp = Idp::start().await;
     let authorizer = Authorizer::new(idp.config());
