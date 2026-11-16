@@ -55,11 +55,14 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
 struct SecretContextHooks;
 
 impl AuthorizerHooks for SecretContextHooks {
-    async fn build_additional_context(&self, _claims: &Claims) -> Result<Context, BoxError> {
-        Ok(Context::from([(
-            "sensitiveValue".to_owned(),
-            "do-not-log".into(),
-        )]))
+    async fn build_context(
+        &self,
+        _claims: &Claims,
+        mut context: Context,
+    ) -> Result<Context, BoxError> {
+        context.insert("sensitiveValue".to_owned(), "do-not-log".into());
+
+        Ok(context)
     }
 }
 

@@ -22,9 +22,11 @@ impl AuthorizerHooks for Hooks {
         Ok(())
     }
 
-    async fn build_additional_context(&self, claims: &Claims) -> Result<Context, BoxError> {
-        let mut context = Context::new();
-
+    async fn build_context(
+        &self,
+        claims: &Claims,
+        mut context: Context,
+    ) -> Result<Context, BoxError> {
         for (key, claim_name) in [
             ("email", "email"),
             ("scopes", "scope"),

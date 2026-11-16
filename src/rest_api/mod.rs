@@ -54,13 +54,16 @@ pub trait AuthorizerHooks: Send + Sync {
         async { Ok(()) }
     }
 
-    /// Context merged over the default and `MONDO_CONTEXT_CLAIMS` context.
-    fn build_additional_context(
+    /// Returns the context to send to the integration. `context` holds the default `tenantId`,
+    /// `appId`, and `userId` values and the `MONDO_CONTEXT_CLAIMS` mappings; the hook can add,
+    /// replace, or remove entries.
+    fn build_context(
         &self,
         claims: &Claims,
+        context: Context,
     ) -> impl Future<Output = Result<Context, BoxError>> + Send {
         let _ = claims;
-        async { Ok(Context::new()) }
+        async move { Ok(context) }
     }
 
     /// Fields merged over the `MONDO_POLICY_STATEMENT` policy statement.
@@ -172,12 +175,11 @@ impl<H: AuthorizerHooks> Authorizer<H> {
 
         let mut context = build_default_context(&claims);
         context.extend(build_mapped_context(&claims, &self.config.context_claims));
-        context.extend(
-            self.hooks
-                .build_additional_context(&claims)
-                .await
-                .map_err(Error::from_hook)?,
-        );
+        let context = self
+            .hooks
+            .build_context(&claims, context)
+            .await
+            .map_err(Error::from_hook)?;
 
         let policy_statement = self.config.policy_statement.clone().merge(
             self.hooks

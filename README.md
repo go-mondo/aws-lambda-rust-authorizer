@@ -157,9 +157,11 @@ impl AuthorizerHooks for Hooks {
         Ok(())
     }
 
-    async fn build_additional_context(&self, claims: &Claims) -> Result<Context, BoxError> {
-        let mut context = Context::new();
-
+    async fn build_context(
+        &self,
+        claims: &Claims,
+        mut context: Context,
+    ) -> Result<Context, BoxError> {
         for (key, claim_name) in [
             ("email", "email"),
             ("scopes", "scope"),
@@ -210,7 +212,9 @@ async fn main() -> Result<(), lambda_runtime::Error> {
 }
 ```
 
-Errors from `build_additional_context` and `build_policy_statement` fail the request with a 500,
+`build_context` receives the default and `MONDO_CONTEXT_CLAIMS` context and returns the context to
+send, so it can also replace or remove entries, such as dropping `appId`. Errors from
+`build_context` and `build_policy_statement` fail the request with a 500,
 unless the error is `Error::Unauthorized`, which denies it.
 
 This example decides per method and returns a policy for the requested `methodArn` only. Because
@@ -285,7 +289,10 @@ Behavior that differs from the Node.js authorizer:
   already has instead of failing requests.
 
 Apps with a custom handler built with `createRestApiAuthorizerHandler` need their callbacks ported
-to Rust. Each callback maps to an `AuthorizerHooks` method with the same name in snake case; see
+to Rust as `AuthorizerHooks` methods: `validateClaims` becomes `validate_claims`,
+`buildPolicyStatement` becomes `build_policy_statement`, and `buildAdditionalContext` becomes
+`build_context`. `build_context` receives the assembled context and returns the final one, so
+instead of returning `{ key: undefined }` to drop a key, call `context.remove("key")`. See
 [Custom Handler](#custom-handler).
 
 ## Development

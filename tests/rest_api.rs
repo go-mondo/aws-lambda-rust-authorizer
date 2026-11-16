@@ -173,7 +173,11 @@ impl AuthorizerHooks for CustomHooks {
         Ok(())
     }
 
-    async fn build_additional_context(&self, claims: &Claims) -> Result<Context, BoxError> {
+    async fn build_context(
+        &self,
+        claims: &Claims,
+        mut context: Context,
+    ) -> Result<Context, BoxError> {
         if get_claim(claims, "email").as_deref() == Some("blocked@example.com") {
             return Err(Error::Unauthorized.into());
         }
@@ -185,10 +189,11 @@ impl AuthorizerHooks for CustomHooks {
             return Err("Unauthorized".into());
         }
 
-        Ok(Context::from([
-            ("appId".to_owned(), "overridden".into()),
-            ("isAdmin".to_owned(), true.into()),
-        ]))
+        context.insert("appId".to_owned(), "overridden".into());
+        context.insert("isAdmin".to_owned(), true.into());
+        context.remove("userId");
+
+        Ok(context)
     }
 
     async fn build_policy_statement(
@@ -224,6 +229,7 @@ async fn runs_custom_hooks() {
     assert_eq!(response.context["appId"], "overridden".into());
     assert_eq!(response.context["isAdmin"], true.into());
     assert_eq!(response.context["tenantId"], "tnt_123".into());
+    assert!(!response.context.contains_key("userId"));
     assert_eq!(
         response.policy_document.statement[0].effect,
         PolicyEffect::Deny
