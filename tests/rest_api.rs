@@ -1,6 +1,6 @@
 mod common;
 
-use common::{AUDIENCE, Idp, METHOD_ARN, event, now, sign};
+use common::{AUDIENCE, Idp, METHOD_ARN, event, now, sign, sign_rs256};
 use mondo_lambda_authorizer::rest_api::{
     Authorizer, AuthorizerHooks, BoxError, Claims, Config, Context, Error, PolicyEffect,
     PolicyInput, PolicyStatementOverride, StringOrArray, TokenAuthorizerEvent, get_claim,
@@ -35,6 +35,23 @@ async fn authorizes_a_valid_token_with_default_context_and_policy() {
             "principalId": "usr_123",
         })
     );
+}
+
+#[tokio::test]
+async fn verifies_rs256_tokens() {
+    let idp = Idp::start().await;
+    let authorizer = Authorizer::new(idp.config());
+
+    let response = authorizer
+        .authorize(&event(&idp.rs256_token(json!({}))))
+        .await
+        .unwrap();
+    assert_eq!(response.principal_id, "usr_123");
+
+    // An RS256 signature never verifies against the EC key, even when the header names it.
+    let mismatched = sign_rs256(&idp.claims(json!({})), "test-key");
+    let error = authorizer.authorize(&event(&mismatched)).await.unwrap_err();
+    assert!(error.is_unauthorized());
 }
 
 #[tokio::test]
