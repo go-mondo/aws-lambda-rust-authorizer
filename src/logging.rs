@@ -13,11 +13,12 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 use tracing::field::{Field, Visit};
 use tracing::level_filters::LevelFilter;
-use tracing::{Event, Metadata, Subscriber};
-use tracing_subscriber::filter::FilterExt;
+use tracing::{Event, Level, Metadata, Subscriber};
+use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::fmt::format::{JsonFields, Writer};
 use tracing_subscriber::fmt::time::{FormatTime, SystemTime};
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields, MakeWriter};
@@ -31,8 +32,11 @@ pub const DEFAULT_SERVICE_NAME: &str = "mondo-rest-api-authorizer";
 /// Dependencies whose `DEBUG` and `TRACE` logs are suppressed.
 const NOISY_TARGETS: &[&str] = &["h2", "hyper", "hyper_util", "reqwest", "rustls", "tower"];
 
-/// Where `lambda_runtime` logs every error a handler returns, at `ERROR`.
+/// Where `lambda_runtime` logs every error a handler returns, and every panic, at `ERROR`.
 const RUNTIME_HANDLER_ERROR_TARGET: &str = "lambda_runtime::layers::panic";
+
+/// The message `lambda_runtime` logs a handler panic with.
+const RUNTIME_PANIC_MESSAGE: &str = "user handler panicked";
 
 /// Installs the global subscriber, configured from the environment.
 ///
@@ -101,7 +105,15 @@ impl LogConfig {
         let filter = || {
             EnvFilter::try_new(&self.directives)
                 .unwrap_or_else(|_| EnvFilter::new("info"))
-                .and(SuppressRuntimeUnauthorized)
+                // lambda_runtime records `requestId` and `xrayTraceId` on an `INFO` span, which
+                // `WARN` and `ERROR` lines need even when the level filters out `INFO`.
+                .or(filter_fn(|metadata| {
+                    metadata.is_span()
+                        && *metadata.level() <= Level::INFO
+                        && metadata.target().starts_with("lambda_runtime")
+                })
+                .with_max_level_hint(LevelFilter::INFO))
+                .and(SuppressRuntimeHandlerErrors)
         };
 
         let layer = if self.json {
@@ -147,11 +159,12 @@ fn level_directives(level: LevelFilter) -> String {
     directives
 }
 
-/// Drops `lambda_runtime`'s `ERROR` line for denied requests. A denial is expected traffic, and
-/// the authorizer already logs it as a warning with the reason.
-struct SuppressRuntimeUnauthorized;
+/// Drops the `ERROR` line `lambda_runtime` logs for every error the handler returns, so each
+/// request logs its outcome once. The authorizer already logs a denial as a warning with the
+/// reason, and a failure as an error. Panics are still logged.
+struct SuppressRuntimeHandlerErrors;
 
-impl<S> Filter<S> for SuppressRuntimeUnauthorized {
+impl<S> Filter<S> for SuppressRuntimeHandlerErrors {
     fn enabled(&self, _metadata: &Metadata<'_>, _cx: &Context<'_, S>) -> bool {
         true
     }
@@ -164,8 +177,7 @@ impl<S> Filter<S> for SuppressRuntimeUnauthorized {
         let mut fields = FieldVisitor::default();
         event.record(&mut fields);
 
-        // The runtime logs the handler's error with `{:?}`, which is `Unauthorized` for a denial.
-        fields.message.as_deref() != Some("Unauthorized")
+        fields.message.as_deref() == Some(RUNTIME_PANIC_MESSAGE)
     }
 }
 
@@ -190,21 +202,11 @@ where
         let mut fields = FieldVisitor::default();
         event.record(&mut fields);
 
-        let mut entries = vec![
-            ("timestamp".to_owned(), Value::String(timestamp)),
-            (
-                "level".to_owned(),
-                Value::String(event.metadata().level().to_string()),
-            ),
-            (
-                "message".to_owned(),
-                Value::String(fields.message.unwrap_or_default()),
-            ),
-            (
-                "service".to_owned(),
-                Value::String(self.service_name.clone()),
-            ),
-        ];
+        let mut line = OrderedObject::default();
+        line.insert("timestamp", Value::String(timestamp));
+        line.insert("level", Value::String(event.metadata().level().to_string()));
+        line.insert("message", Value::String(fields.message.unwrap_or_default()));
+        line.insert("service", Value::String(self.service_name.clone()));
 
         // Span fields, outermost first, e.g. lambda_runtime's `requestId` and `xrayTraceId`.
         if let Some(scope) = ctx.event_scope() {
@@ -217,7 +219,7 @@ where
                     continue;
                 };
 
-                entries.extend(
+                line.extend(
                     span_fields
                         .into_iter()
                         .map(|(name, value)| (camel_case(&name), value)),
@@ -225,29 +227,42 @@ where
             }
         }
 
-        entries.extend(fields.fields);
-
         // Later entries win, so event fields override span fields with the same name.
-        let mut line = Map::new();
-        let mut order = Vec::new();
-        for (name, value) in entries {
-            if line.insert(name.clone(), value).is_none() {
-                order.push(name);
-            }
-        }
+        line.extend(fields.fields);
 
-        let mut output = String::from("{");
-        for (index, name) in order.iter().enumerate() {
-            if index > 0 {
-                output.push(',');
-            }
-            output.push_str(&Value::String(name.clone()).to_string());
-            output.push(':');
-            output.push_str(&line[name].to_string());
-        }
-        output.push('}');
-
+        let output = serde_json::to_string(&line).map_err(|_| fmt::Error)?;
         writeln!(writer, "{output}")
+    }
+}
+
+/// A JSON object that keeps the order its keys were first inserted in. [`serde_json::Map`] sorts
+/// them.
+#[derive(Default)]
+struct OrderedObject(Vec<(String, Value)>);
+
+impl OrderedObject {
+    /// Adds an entry, or replaces the value in place if the key is already present.
+    fn insert(&mut self, name: impl Into<String>, value: Value) {
+        let name = name.into();
+
+        match self.0.iter_mut().find(|(existing, _)| *existing == name) {
+            Some((_, existing)) => *existing = value,
+            None => self.0.push((name, value)),
+        }
+    }
+}
+
+impl Extend<(String, Value)> for OrderedObject {
+    fn extend<I: IntoIterator<Item = (String, Value)>>(&mut self, entries: I) {
+        for (name, value) in entries {
+            self.insert(name, value);
+        }
+    }
+}
+
+impl Serialize for OrderedObject {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().map(|(name, value)| (name, value)))
     }
 }
 

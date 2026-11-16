@@ -1,6 +1,6 @@
 {
   "name": "@go-mondo/aws-lambda-rust-authorizer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "AWS Lambda Rust authorizers for Mondo Identity, with AWS CDK constructs.",
   "type": "module",
   "sideEffects": false,

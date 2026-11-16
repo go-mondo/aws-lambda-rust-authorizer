@@ -128,7 +128,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::rest_api::policy::PolicyEffect;
+    use aws_lambda_events::iam::IamPolicyEffect;
 
     fn from_vars(vars: &[(&str, &str)]) -> Result<Config, Error> {
         let vars: HashMap<String, String> = vars
@@ -157,7 +157,7 @@ mod tests {
             ClaimExpectation::ContainsAll(vec!["openid".into(), "email".into()])
         );
         assert_eq!(config.context_claims["scopes"], "scope");
-        assert_eq!(config.policy_statement.effect, Some(PolicyEffect::Deny));
+        assert_eq!(config.policy_statement.effect, Some(IamPolicyEffect::Deny));
     }
 
     #[test]
@@ -185,6 +185,21 @@ mod tests {
             ]),
             Err(Error::InvalidEnvJson {
                 name: "MONDO_CONTEXT_CLAIMS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_policy_statement_fields() {
+        assert!(matches!(
+            from_vars(&[
+                ("MONDO_IDP_DOMAIN_NAME", "example.com"),
+                ("MONDO_AUDIENCE", "aud"),
+                ("MONDO_POLICY_STATEMENT", r#"{"Effect":"Deny"}"#),
+            ]),
+            Err(Error::InvalidEnvJson {
+                name: "MONDO_POLICY_STATEMENT",
                 ..
             })
         ));

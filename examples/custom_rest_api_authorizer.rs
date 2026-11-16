@@ -1,8 +1,8 @@
 //! The custom handler from the README. Keep the two in sync.
 
 use mondo_lambda_authorizer::rest_api::{
-    self, Authorizer, AuthorizerHooks, BoxError, Claims, Context, Error, PolicyEffect, PolicyInput,
-    PolicyStatementOverride, get_claim, get_scopes,
+    self, Authorizer, AuthorizerHooks, BoxError, Claims, Context, Error, IamPolicyEffect,
+    PolicyInput, PolicyStatementOverride, get_claim, get_scopes,
 };
 
 struct Hooks {
@@ -47,22 +47,34 @@ impl AuthorizerHooks for Hooks {
         &self,
         input: PolicyInput<'_>,
     ) -> Result<PolicyStatementOverride, BoxError> {
-        let is_write_request =
-            input.method_arn.contains("/POST/") || input.method_arn.contains("/PUT/");
+        // Every method but a read needs the `api:write` scope, so DELETE, PATCH, and methods
+        // added later are covered, and a method ARN that can't be parsed is denied.
+        let is_read_request = matches!(
+            http_method(input.method_arn),
+            Some("GET" | "HEAD" | "OPTIONS")
+        );
         let can_write = get_scopes(input.claims, "scope")
             .iter()
             .any(|scope| scope == "api:write");
 
         Ok(PolicyStatementOverride {
-            effect: Some(if is_write_request && !can_write {
-                PolicyEffect::Deny
+            effect: Some(if is_read_request || can_write {
+                IamPolicyEffect::Allow
             } else {
-                PolicyEffect::Allow
+                IamPolicyEffect::Deny
             }),
-            resource: Some(input.method_arn.into()),
+            resource: Some(vec![input.method_arn.to_owned()]),
             ..Default::default()
         })
     }
+}
+
+/// Reads the HTTP method from a method ARN, e.g. `GET` from
+/// `arn:aws:execute-api:us-east-1:123456789012:a1b2c3d4e5/prod/GET/customers/123`. It reads the
+/// method's own segment, so a path such as `/blog/POST/1` isn't mistaken for a POST.
+fn http_method(method_arn: &str) -> Option<&str> {
+    // The sixth `:`-separated field is `<api id>/<stage>/<method>/<path>`.
+    method_arn.splitn(6, ':').nth(5)?.split('/').nth(2)
 }
 
 #[tokio::main]

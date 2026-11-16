@@ -1,87 +1,41 @@
-use serde::{Deserialize, Serialize};
+use aws_lambda_events::apigw::{
+    ApiGatewayCustomAuthorizerPolicy, ApiGatewayCustomAuthorizerResponse,
+};
+use aws_lambda_events::iam::{IamPolicyEffect, IamPolicyStatement};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::claims::Context;
 
-/// The API Gateway `TOKEN` authorizer event.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TokenAuthorizerEvent {
-    #[serde(rename = "type", default)]
-    pub kind: String,
-    #[serde(default)]
-    pub authorization_token: Option<String>,
-    pub method_arn: String,
-}
-
-/// The API Gateway authorizer result.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AuthorizerResponse {
-    pub principal_id: String,
-    pub policy_document: PolicyDocument,
-    pub context: Context,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct PolicyDocument {
-    pub version: String,
-    pub statement: Vec<PolicyStatement>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct PolicyStatement {
-    pub action: StringOrArray,
-    pub effect: PolicyEffect,
-    pub resource: StringOrArray,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PolicyEffect {
-    #[default]
-    Allow,
-    Deny,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum StringOrArray {
-    String(String),
-    Array(Vec<String>),
-}
-
-impl From<String> for StringOrArray {
-    fn from(value: String) -> Self {
-        Self::String(value)
-    }
-}
-
-impl From<&str> for StringOrArray {
-    fn from(value: &str) -> Self {
-        Self::String(value.to_owned())
-    }
-}
-
-impl From<Vec<String>> for StringOrArray {
-    fn from(value: Vec<String>) -> Self {
-        Self::Array(value)
-    }
-}
+/// The API Gateway authorizer result, with the authorizer's [`Context`].
+pub type AuthorizerResponse = ApiGatewayCustomAuthorizerResponse<Context>;
 
 /// Overrides for the IAM policy statement returned by the authorizer.
 ///
 /// Omitted fields default to `execute-api:Invoke`, `Allow`, and every method and path in the
 /// incoming `methodArn`'s API stage (see [`build_all_methods_resource`]), so a policy cached by
 /// API Gateway for a token applies to every endpoint that token calls.
+///
+/// Unknown fields are rejected, so a misspelled or IAM-style `"Effect"` key fails at startup
+/// instead of being ignored in favor of the default `Allow`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyStatementOverride {
+    /// Accepts a string or an array of strings.
+    #[serde(
+        default,
+        deserialize_with = "string_or_array",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub action: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action: Option<StringOrArray>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effect: Option<PolicyEffect>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resource: Option<StringOrArray>,
+    pub effect: Option<IamPolicyEffect>,
+    /// Accepts a string or an array of strings.
+    #[serde(
+        default,
+        deserialize_with = "string_or_array",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub resource: Option<Vec<String>>,
 }
 
 impl PolicyStatementOverride {
@@ -95,30 +49,52 @@ impl PolicyStatementOverride {
     }
 }
 
-impl AuthorizerResponse {
-    pub(crate) fn new(
-        principal_id: String,
-        method_arn: &str,
-        policy_statement: PolicyStatementOverride,
-        context: Context,
-    ) -> Self {
-        Self {
-            context,
-            policy_document: PolicyDocument {
-                statement: vec![PolicyStatement {
-                    action: policy_statement
-                        .action
-                        .unwrap_or_else(|| "execute-api:Invoke".into()),
-                    effect: policy_statement.effect.unwrap_or_default(),
-                    resource: policy_statement
-                        .resource
-                        .unwrap_or_else(|| build_all_methods_resource(method_arn).into()),
-                }],
-                version: "2012-10-17".to_owned(),
-            },
-            principal_id,
-        }
+/// Reads `"value"` as `["value"]`, so settings written for the Node.js authorizer still parse.
+fn string_or_array<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrArray {
+        String(String),
+        Array(Vec<String>),
     }
+
+    Ok(
+        Option::<StringOrArray>::deserialize(deserializer)?.map(|value| match value {
+            StringOrArray::String(value) => vec![value],
+            StringOrArray::Array(values) => values,
+        }),
+    )
+}
+
+/// Builds the response for `method_arn`. The `aws_lambda_events` types are `#[non_exhaustive]`, so
+/// they're built from their defaults rather than with struct literals.
+pub(crate) fn build_response(
+    principal_id: String,
+    method_arn: &str,
+    policy_statement: PolicyStatementOverride,
+    context: Context,
+) -> AuthorizerResponse {
+    let mut statement = IamPolicyStatement::default();
+    statement.action = policy_statement
+        .action
+        .unwrap_or_else(|| vec!["execute-api:Invoke".to_owned()]);
+    statement.effect = policy_statement.effect.unwrap_or_default();
+    statement.resource = policy_statement
+        .resource
+        .unwrap_or_else(|| vec![build_all_methods_resource(method_arn)]);
+
+    let mut policy_document = ApiGatewayCustomAuthorizerPolicy::default();
+    policy_document.version = Some("2012-10-17".to_owned());
+    policy_document.statement = vec![statement];
+
+    let mut response = AuthorizerResponse::default();
+    response.principal_id = Some(principal_id);
+    response.policy_document = policy_document;
+    response.context = context;
+
+    response
 }
 
 /// Converts a method ARN into an execute-api resource covering every method and path in the
@@ -187,24 +163,55 @@ mod tests {
         let base: PolicyStatementOverride =
             serde_json::from_value(json!({ "action": "execute-api:*", "effect": "Deny" })).unwrap();
         let merged = base.merge(PolicyStatementOverride {
-            effect: Some(PolicyEffect::Allow),
-            resource: Some(vec!["a".to_owned(), "b".to_owned()].into()),
+            effect: Some(IamPolicyEffect::Allow),
+            resource: Some(vec!["a".to_owned(), "b".to_owned()]),
             ..Default::default()
         });
 
         assert_eq!(
             merged,
             PolicyStatementOverride {
-                action: Some("execute-api:*".into()),
-                effect: Some(PolicyEffect::Allow),
-                resource: Some(vec!["a".to_owned(), "b".to_owned()].into()),
+                action: Some(vec!["execute-api:*".to_owned()]),
+                effect: Some(IamPolicyEffect::Allow),
+                resource: Some(vec!["a".to_owned(), "b".to_owned()]),
             }
         );
     }
 
     #[test]
+    fn reads_policy_statement_actions_and_resources_as_strings_or_arrays() {
+        let statement: PolicyStatementOverride = serde_json::from_value(
+            json!({ "action": ["execute-api:Invoke"], "resource": "*", "effect": null }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            statement,
+            PolicyStatementOverride {
+                action: Some(vec!["execute-api:Invoke".to_owned()]),
+                effect: None,
+                resource: Some(vec!["*".to_owned()]),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_policy_statement_fields() {
+        for value in [
+            json!({ "Effect": "Deny" }),
+            json!({ "efect": "Deny" }),
+            json!({ "effect": "Deny", "condition": {} }),
+        ] {
+            assert!(
+                serde_json::from_value::<PolicyStatementOverride>(value.clone()).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
     fn serializes_the_authorizer_response_in_api_gateway_format() {
-        let response = AuthorizerResponse::new(
+        let response = build_response(
             "usr_123".to_owned(),
             "arn:aws:execute-api:us-east-1:123456789012:a1b2c3d4e5/prod/GET/",
             PolicyStatementOverride::default(),
@@ -217,13 +224,14 @@ mod tests {
                 "context": { "tenantId": "tnt_123" },
                 "policyDocument": {
                     "Statement": [{
-                        "Action": "execute-api:Invoke",
+                        "Action": ["execute-api:Invoke"],
                         "Effect": "Allow",
-                        "Resource": "arn:aws:execute-api:us-east-1:123456789012:a1b2c3d4e5/prod/*/*",
+                        "Resource": ["arn:aws:execute-api:us-east-1:123456789012:a1b2c3d4e5/prod/*/*"],
                     }],
                     "Version": "2012-10-17",
                 },
                 "principalId": "usr_123",
+                "usageIdentifierKey": null,
             })
         );
     }

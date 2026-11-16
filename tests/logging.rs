@@ -6,10 +6,10 @@ mod common;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use common::{Idp, METHOD_ARN, event};
+use common::{Idp, METHOD_ARN, event, event_with_authorization};
 use mondo_lambda_authorizer::logging::LogConfig;
 use mondo_lambda_authorizer::rest_api::{
-    Authorizer, AuthorizerHooks, BoxError, Claims, Context, Error, TokenAuthorizerEvent,
+    Authorizer, AuthorizerHooks, BoxError, Claims, Context, Error,
 };
 use serde_json::{Value, json};
 use tracing::Instrument;
@@ -69,6 +69,7 @@ impl AuthorizerHooks for SecretContextHooks {
 /// The span `lambda_runtime` opens around each invocation.
 fn invocation_span() -> tracing::Span {
     tracing::info_span!(
+        target: "lambda_runtime::layers::trace",
         "Lambda runtime invoke",
         requestId = "req-123",
         xrayTraceId = "Root=1-abc"
@@ -96,18 +97,16 @@ async fn writes_structured_lambda_json_logs_without_secrets() {
 
     // A credential sent without a scheme must not be logged as the scheme.
     let error = authorizer
-        .authorize(&TokenAuthorizerEvent {
-            authorization_token: Some(token.clone()),
-            ..event("")
-        })
+        .authorize(&event_with_authorization(&token))
         .instrument(invocation_span())
         .await
         .unwrap_err();
     assert!(error.is_unauthorized());
 
-    // What lambda_runtime logs for each error the handler returns.
+    // What lambda_runtime logs for each error the handler returns, and for a panic.
     tracing::error!(target: "lambda_runtime::layers::panic", "{:?}", Error::Unauthorized);
     tracing::error!(target: "lambda_runtime::layers::panic", "{:?}", Error::DiscoveryStatus(503));
+    tracing::error!(target: "lambda_runtime::layers::panic", error = "boom", "user handler panicked");
     tracing::debug!(target: "hyper_util::client::legacy::pool", "pooling idle connection");
 
     let lines = logs.lines();
@@ -144,11 +143,44 @@ async fn writes_structured_lambda_json_logs_without_secrets() {
     assert_eq!(denied["details"]["hasAuthorizationToken"], true);
     assert_eq!(denied["details"]["authorizationScheme"], Value::Null);
 
+    // The authorizer logs each outcome itself, so the runtime's duplicates are dropped.
     assert!(logs.line("Unauthorized").is_none());
-    assert_eq!(logs.line("DiscoveryStatus(503)").unwrap()["level"], "ERROR");
+    assert!(logs.line("DiscoveryStatus(503)").is_none());
+    assert_eq!(
+        logs.line("user handler panicked").unwrap()["level"],
+        "ERROR"
+    );
     assert!(logs.line("pooling idle connection").is_none());
 
     let output = serde_json::to_string(&lines).unwrap();
     assert!(!output.contains("do-not-log"));
     assert!(!output.contains(&token[..20]));
+
+    // At `WARN`, lines keep the fields of the `INFO` invocation span.
+    let warn_logs = LogBuffer::default();
+    let warn_subscriber = LogConfig::from_env()
+        .with_json(true)
+        .with_level(LevelFilter::WARN)
+        .subscriber(warn_logs.clone());
+    {
+        let _guard = tracing::subscriber::set_default(warn_subscriber);
+        authorizer
+            .authorize(&event(&idp.token(json!({ "aud": "other" }))))
+            .instrument(invocation_span())
+            .await
+            .unwrap_err();
+    }
+
+    let denied = warn_logs
+        .line("REST API authorizer request denied")
+        .unwrap();
+    assert_eq!(denied["requestId"], "req-123");
+    assert_eq!(denied["xrayTraceId"], "Root=1-abc");
+    // Parsing sorts keys, so check their order in the raw line.
+    let raw = String::from_utf8(warn_logs.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        raw.starts_with(r#"{"timestamp":"#) && raw.contains(r#","level":"WARN","message":"#),
+        "{raw}"
+    );
+    assert_eq!(warn_logs.lines().len(), 1);
 }

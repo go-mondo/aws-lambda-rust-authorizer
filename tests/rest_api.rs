@@ -1,10 +1,9 @@
 mod common;
 
-use common::{AUDIENCE, Idp, METHOD_ARN, event, now, sign, sign_rs256};
+use common::{AUDIENCE, Idp, METHOD_ARN, event, event_with_authorization, now, sign, sign_rs256};
 use mondo_lambda_authorizer::rest_api::{
-    Authorizer, AuthorizerHooks, BoxError, Claims, Config, Context, Error, PolicyEffect,
-    PolicyInput, PolicyStatementOverride, StringOrArray, TokenAuthorizerEvent, get_claim,
-    get_scopes,
+    Authorizer, AuthorizerHooks, BoxError, Claims, Config, Context, Error, IamPolicyEffect,
+    PolicyInput, PolicyStatementOverride, get_claim, get_scopes,
 };
 use serde_json::json;
 use wiremock::matchers::method;
@@ -26,13 +25,14 @@ async fn authorizes_a_valid_token_with_default_context_and_policy() {
             "context": { "appId": "app_123", "tenantId": "tnt_123", "userId": "usr_123" },
             "policyDocument": {
                 "Statement": [{
-                    "Action": "execute-api:Invoke",
+                    "Action": ["execute-api:Invoke"],
                     "Effect": "Allow",
-                    "Resource": "arn:aws:execute-api:us-east-1:123456789012:a1b2c3d4e5/prod/*/*",
+                    "Resource": ["arn:aws:execute-api:us-east-1:123456789012:a1b2c3d4e5/prod/*/*"],
                 }],
                 "Version": "2012-10-17",
             },
             "principalId": "usr_123",
+            "usageIdentifierKey": null,
         })
     );
 }
@@ -46,7 +46,7 @@ async fn verifies_rs256_tokens() {
         .authorize(&event(&idp.rs256_token(json!({}))))
         .await
         .unwrap();
-    assert_eq!(response.principal_id, "usr_123");
+    assert_eq!(response.principal_id.as_deref(), Some("usr_123"));
 
     // An RS256 signature never verifies against the EC key, even when the header names it.
     let mismatched = sign_rs256(&idp.claims(json!({})), "test-key");
@@ -65,7 +65,7 @@ async fn uses_a_default_principal_without_sub() {
         .await
         .unwrap();
 
-    assert_eq!(response.principal_id, "mondo-user");
+    assert_eq!(response.principal_id.as_deref(), Some("mondo-user"));
     assert!(!response.context.contains_key("userId"));
 }
 
@@ -148,14 +148,23 @@ async fn rejects_missing_bearer_tokens() {
     let authorizer = Authorizer::new(idp.config());
 
     let error = authorizer
-        .authorize(&TokenAuthorizerEvent {
-            authorization_token: Some("Basic abc".to_owned()),
-            ..event("")
-        })
+        .authorize(&event_with_authorization("Basic abc"))
         .await
         .unwrap_err();
 
     assert!(error.is_unauthorized());
+}
+
+#[tokio::test]
+async fn fails_without_a_method_arn() {
+    let idp = Idp::start().await;
+    let authorizer = Authorizer::new(idp.config());
+    let mut event = event(&idp.token(json!({})));
+    event.method_arn = None;
+
+    let error = authorizer.authorize(&event).await.unwrap_err();
+
+    assert!(matches!(error, Error::MissingMethodArn));
 }
 
 #[tokio::test]
@@ -180,9 +189,9 @@ async fn applies_configured_claims_context_and_policy() {
     assert_eq!(response.context["scopes"], "openid profile email".into());
     assert_eq!(
         response.policy_document.statement[0].action,
-        StringOrArray::Array(vec!["execute-api:Invoke".to_owned()])
+        ["execute-api:Invoke"]
     );
-    assert_eq!(response.policy_document.statement[0].resource, "*".into());
+    assert_eq!(response.policy_document.statement[0].resource, ["*"]);
 
     let error = authorizer
         .authorize(&event(&idp.token(json!({ "scope": "openid profile" }))))
@@ -236,11 +245,11 @@ impl AuthorizerHooks for CustomHooks {
 
         Ok(PolicyStatementOverride {
             effect: Some(if can_write {
-                PolicyEffect::Allow
+                IamPolicyEffect::Allow
             } else {
-                PolicyEffect::Deny
+                IamPolicyEffect::Deny
             }),
-            resource: Some(input.method_arn.into()),
+            resource: Some(vec![input.method_arn.to_owned()]),
             ..Default::default()
         })
     }
@@ -264,12 +273,9 @@ async fn runs_custom_hooks() {
     assert!(!response.context.contains_key("userId"));
     assert_eq!(
         response.policy_document.statement[0].effect,
-        PolicyEffect::Deny
+        IamPolicyEffect::Deny
     );
-    assert_eq!(
-        response.policy_document.statement[0].resource,
-        METHOD_ARN.into()
-    );
+    assert_eq!(response.policy_document.statement[0].resource, [METHOD_ARN]);
 
     let wrong_app = authorizer
         .authorize(&event(&idp.token(json!({ "azp": "app_other" }))))
@@ -311,6 +317,10 @@ async fn fails_without_unauthorized_when_discovery_fails() {
     let authorizer = Authorizer::new(Config::new(server.uri(), [AUDIENCE]));
 
     let error = authorizer.verify_token("a.b.c").await.unwrap_err();
-
     assert!(matches!(error, Error::DiscoveryStatus(503)));
+
+    // An unreachable IdP isn't retried on every request.
+    let error = authorizer.verify_token("a.b.c").await.unwrap_err();
+    assert!(matches!(error, Error::DiscoveryCooldown));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }

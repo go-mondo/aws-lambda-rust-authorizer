@@ -3,7 +3,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use mondo_lambda_authorizer::rest_api::{Config, TokenAuthorizerEvent};
+use mondo_lambda_authorizer::rest_api::{ApiGatewayCustomAuthorizerRequest, Config};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -133,10 +133,15 @@ pub fn now() -> u64 {
         .as_secs()
 }
 
-pub fn event(token: &str) -> TokenAuthorizerEvent {
-    TokenAuthorizerEvent {
-        kind: "TOKEN".to_owned(),
-        authorization_token: Some(format!("Bearer {token}")),
-        method_arn: METHOD_ARN.to_owned(),
-    }
+pub fn event(token: &str) -> ApiGatewayCustomAuthorizerRequest {
+    event_with_authorization(&format!("Bearer {token}"))
+}
+
+pub fn event_with_authorization(authorization: &str) -> ApiGatewayCustomAuthorizerRequest {
+    // The type is `#[non_exhaustive]`, so it can't be built with a struct literal.
+    let mut event = ApiGatewayCustomAuthorizerRequest::default();
+    event.type_ = Some("TOKEN".to_owned());
+    event.authorization_token = Some(authorization.to_owned());
+    event.method_arn = Some(METHOD_ARN.to_owned());
+    event
 }

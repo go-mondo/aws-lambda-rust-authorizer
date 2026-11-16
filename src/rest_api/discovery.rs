@@ -13,6 +13,8 @@ use super::error::Error;
 /// Matches jose's `createRemoteJWKSet` defaults.
 const JWKS_CACHE_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 const JWKS_COOLDOWN: Duration = Duration::from_secs(30);
+/// How long a failed OIDC discovery fails requests before it's retried.
+pub(crate) const DISCOVERY_COOLDOWN: Duration = JWKS_COOLDOWN;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct Discovery {
@@ -34,9 +36,8 @@ struct RawJwkSet {
 impl Discovery {
     pub(crate) async fn fetch(
         client: &reqwest::Client,
-        discovery_url: String,
+        discovery_url: &str,
     ) -> Result<Self, Error> {
-        let discovery_url = discovery_url.as_str();
         tracing::info!(discovery_url, "Fetching OIDC discovery configuration");
 
         let response = client
@@ -46,8 +47,10 @@ impl Discovery {
             .await?;
         let status = response.status();
 
+        // Failures are logged as warnings: the request's failure is logged once, as an error, by
+        // `Authorizer::authorize`.
         if !status.is_success() {
-            tracing::error!(
+            tracing::warn!(
                 discovery_url,
                 status = status.as_u16(),
                 "OIDC discovery request failed"
@@ -56,18 +59,24 @@ impl Discovery {
             return Err(Error::DiscoveryStatus(status.as_u16()));
         }
 
-        let configuration: OpenIdConfiguration = response.json().await?;
+        let configuration: OpenIdConfiguration = response.json().await.map_err(|error| {
+            tracing::warn!(discovery_url, error = %error, "OIDC discovery response is not valid JSON");
+            Error::DiscoveryInvalid
+        })?;
         let issuer = configuration.issuer.filter(|value| !value.is_empty());
         let jwks_uri = configuration.jwks_uri.filter(|value| !value.is_empty());
 
-        let (Some(issuer), Some(jwks_uri)) = (issuer.clone(), jwks_uri.clone()) else {
-            tracing::error!(
-                has_issuer = issuer.is_some(),
-                has_jwks_uri = jwks_uri.is_some(),
-                "OIDC discovery response is missing required fields"
-            );
+        let (issuer, jwks_uri) = match (issuer, jwks_uri) {
+            (Some(issuer), Some(jwks_uri)) => (issuer, jwks_uri),
+            (issuer, jwks_uri) => {
+                tracing::warn!(
+                    has_issuer = issuer.is_some(),
+                    has_jwks_uri = jwks_uri.is_some(),
+                    "OIDC discovery response is missing required fields"
+                );
 
-            return Err(Error::DiscoveryIncomplete);
+                return Err(Error::DiscoveryIncomplete);
+            }
         };
 
         tracing::info!(%issuer, %jwks_uri, "OIDC discovery configuration loaded");
@@ -116,20 +125,26 @@ impl RemoteJwks {
     ///
     /// The set is refreshed when it is older than the max age, or when no key matches so that
     /// rotated keys are picked up, at most once per cooldown. Once a set has been fetched, a
-    /// failed refresh is logged and the cached keys keep being used.
+    /// failed refresh is logged and the cached keys keep being used. Until then, a failed fetch
+    /// fails requests without retrying until the cooldown has passed.
     pub(crate) async fn candidate_keys(&self, header: &Header) -> Result<Vec<Arc<JwksKey>>, Error> {
         let mut state = self.state.lock().await;
+        let in_cooldown = state
+            .last_fetch_attempt
+            .is_some_and(|attempt| attempt.elapsed() < self.cooldown);
 
         let Some(cached) = &state.cached else {
-            // Nothing to fall back to, so the first fetch must succeed.
+            // Nothing to fall back to, so the first fetch must succeed. Failing fast during the
+            // cooldown keeps an unreachable IdP from stalling every request until it times out.
+            if in_cooldown {
+                return Err(Error::JwksCooldown);
+            }
+
             return self.reload(&mut state, header).await;
         };
 
         let candidates = select_keys(&cached.keys, header);
         let needs_refresh = candidates.is_empty() || cached.fetched_at.elapsed() >= self.max_age;
-        let in_cooldown = state
-            .last_fetch_attempt
-            .is_some_and(|attempt| attempt.elapsed() < self.cooldown);
 
         if needs_refresh && !in_cooldown {
             match self.reload(&mut state, header).await {
@@ -169,7 +184,7 @@ impl RemoteJwks {
         let status = response.status();
 
         if !status.is_success() {
-            tracing::error!(jwks_uri = %self.uri, status = status.as_u16(), "JWKS request failed");
+            tracing::warn!(jwks_uri = %self.uri, status = status.as_u16(), "JWKS request failed");
 
             return Err(Error::JwksStatus(status.as_u16()));
         }
@@ -361,17 +376,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fails_when_the_first_fetch_fails() {
+    async fn fails_fast_during_the_cooldown_when_the_first_fetch_fails() {
         let server = flaky_jwks_server().await;
         // Use up the server's one successful response so the next fetch gets a 503.
         reqwest::get(server.uri()).await.unwrap();
         let jwks = remote_jwks(&server, JWKS_CACHE_MAX_AGE, JWKS_COOLDOWN);
+        let header = header(Algorithm::ES256, Some("current"));
 
         assert!(matches!(
-            jwks.candidate_keys(&header(Algorithm::ES256, Some("current")))
-                .await,
+            jwks.candidate_keys(&header).await,
             Err(Error::JwksStatus(503))
         ));
+        assert!(matches!(
+            jwks.candidate_keys(&header).await,
+            Err(Error::JwksCooldown)
+        ));
+        assert_eq!(request_count(&server).await, 2);
+    }
+
+    #[tokio::test]
+    async fn retries_a_failed_first_fetch_after_the_cooldown() {
+        let server = flaky_jwks_server().await;
+        reqwest::get(server.uri()).await.unwrap();
+        let jwks = remote_jwks(&server, JWKS_CACHE_MAX_AGE, Duration::ZERO);
+        let header = header(Algorithm::ES256, Some("current"));
+
+        for _ in 0..2 {
+            assert!(matches!(
+                jwks.candidate_keys(&header).await,
+                Err(Error::JwksStatus(503))
+            ));
+        }
+        assert_eq!(request_count(&server).await, 3);
     }
 
     #[tokio::test]

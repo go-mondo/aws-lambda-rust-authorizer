@@ -58,7 +58,9 @@ The Lambda handler parses bearer tokens, discovers issuer and JWKS metadata from
 then returns `tenantId`, `appId`, and `userId` in the authorizer context. The discovery document
 and JWKS are cached for the lifetime of the Lambda execution environment, and the JWKS is reloaded
 when a token's `kid` is not found, so signing-key rotation is picked up automatically. Refreshes
-happen at most every 30 seconds, and if one fails, the cached keys stay in use.
+happen at most every 30 seconds, and if one fails, the cached keys stay in use. If the first fetch
+of either document fails, requests fail with a 500 without contacting the IdP for 30 seconds, then
+the fetch is retried, so an unreachable IdP doesn't hold every request until its 5-second timeout.
 
 By default the returned policy allows every method and path in the requested API stage (for
 example `.../a1b2c3d4e5/prod/*/*`), not just the requested `methodArn`. API Gateway caches
@@ -71,13 +73,13 @@ customized with `MONDO_POLICY_STATEMENT`.
 
 ### Environment variables
 
-| Variable                 | Construct prop            | Format                                                                        |
-| ------------------------ | ------------------------- | ----------------------------------------------------------------------------- |
-| `MONDO_IDP_DOMAIN_NAME`  | `domainName`              | Domain or URL, e.g. `mondo.auth.mondoidentity.com` (required)                 |
-| `MONDO_AUDIENCE`         | `audience`                | String, or JSON array of strings when it starts with `[` (required)           |
-| `MONDO_REQUIRED_CLAIMS`  | `requiredClaims`          | JSON object of claim name to expected value; arrays must all be present       |
-| `MONDO_CONTEXT_CLAIMS`   | `additionalContextClaims` | JSON object of context key to claim name                                      |
-| `MONDO_POLICY_STATEMENT` | `policyStatement`         | JSON object with optional `action`, `effect` (`Allow`/`Deny`), and `resource` |
+| Variable                 | Construct prop            | Format                                                                                                 |
+| ------------------------ | ------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `MONDO_IDP_DOMAIN_NAME`  | `domainName`              | Domain or URL, e.g. `mondo.auth.mondoidentity.com` (required)                                          |
+| `MONDO_AUDIENCE`         | `audience`                | String, or JSON array of strings when it starts with `[` (required)                                    |
+| `MONDO_REQUIRED_CLAIMS`  | `requiredClaims`          | JSON object of claim name to expected value; arrays must all be present                                |
+| `MONDO_CONTEXT_CLAIMS`   | `additionalContextClaims` | JSON object of context key to claim name                                                               |
+| `MONDO_POLICY_STATEMENT` | `policyStatement`         | JSON object with optional `action`, `effect` (`Allow`/`Deny`), and `resource`; other keys are rejected |
 
 `MondoAuthorizerHandler` fails synthesis when `MONDO_IDP_DOMAIN_NAME` or `MONDO_AUDIENCE` is
 missing, whether you set them through props, `environment`, or `addEnvironment`. The handler reads
@@ -104,8 +106,8 @@ the event's fields in camelCase. Structured details, such as why a request was d
 }
 ```
 
-Denied requests log a single `WARN` line with a `reason`, so `ERROR` lines are reserved for
-failures that return a 500. The level follows the function's application log level
+Denied requests log a single `WARN` line with a `reason`, and each failure that returns a 500 logs
+a single `ERROR` line, `Authorizer failed`, so `ERROR` counts track failed requests. The level follows the function's application log level
 (`applicationLogLevelV2`, which sets `AWS_LAMBDA_LOG_LEVEL`), then `RUST_LOG`, defaulting to
 `INFO`. At `DEBUG` and `TRACE`, the HTTP client libraries stay at `INFO`.
 
@@ -136,8 +138,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 ```rust
 use mondo_lambda_authorizer::rest_api::{
-    self, Authorizer, AuthorizerHooks, BoxError, Claims, Context, Error, PolicyEffect, PolicyInput,
-    PolicyStatementOverride, get_claim, get_scopes,
+    self, Authorizer, AuthorizerHooks, BoxError, Claims, Context, Error, IamPolicyEffect,
+    PolicyInput, PolicyStatementOverride, get_claim, get_scopes,
 };
 
 struct Hooks {
@@ -182,22 +184,34 @@ impl AuthorizerHooks for Hooks {
         &self,
         input: PolicyInput<'_>,
     ) -> Result<PolicyStatementOverride, BoxError> {
-        let is_write_request =
-            input.method_arn.contains("/POST/") || input.method_arn.contains("/PUT/");
+        // Every method but a read needs the `api:write` scope, so DELETE, PATCH, and methods
+        // added later are covered, and a method ARN that can't be parsed is denied.
+        let is_read_request = matches!(
+            http_method(input.method_arn),
+            Some("GET" | "HEAD" | "OPTIONS")
+        );
         let can_write = get_scopes(input.claims, "scope")
             .iter()
             .any(|scope| scope == "api:write");
 
         Ok(PolicyStatementOverride {
-            effect: Some(if is_write_request && !can_write {
-                PolicyEffect::Deny
+            effect: Some(if is_read_request || can_write {
+                IamPolicyEffect::Allow
             } else {
-                PolicyEffect::Allow
+                IamPolicyEffect::Deny
             }),
-            resource: Some(input.method_arn.into()),
+            resource: Some(vec![input.method_arn.to_owned()]),
             ..Default::default()
         })
     }
+}
+
+/// Reads the HTTP method from a method ARN, e.g. `GET` from
+/// `arn:aws:execute-api:us-east-1:123456789012:a1b2c3d4e5/prod/GET/customers/123`. It reads the
+/// method's own segment, so a path such as `/blog/POST/1` isn't mistaken for a POST.
+fn http_method(method_arn: &str) -> Option<&str> {
+    // The sixth `:`-separated field is `<api id>/<stage>/<method>/<path>`.
+    method_arn.splitn(6, ':').nth(5)?.split('/').nth(2)
 }
 
 #[tokio::main]
@@ -283,16 +297,44 @@ Behavior that differs from the Node.js authorizer:
 - **Default policy resource.** The default policy allows every method and path in the requested
   API stage instead of only the requested `methodArn`, so cached results no longer deny the same
   token's requests to other endpoints. A `policyStatement.resource` you set still takes precedence.
+- **Response format.** The policy statement's `Action` and `Resource` are always arrays, such as
+  `"Action": ["execute-api:Invoke"]` where the Node.js authorizer returned
+  `"Action": "execute-api:Invoke"`, and the response includes `"usageIdentifierKey": null`. API
+  Gateway treats both forms the same. This only matters for something that reads the Lambda's
+  output directly, such as a test that invokes the function and compares the response.
 - **Configuration checks.** Synthesis fails when the IdP domain or audience is missing. A string
-  `audience` starting with `[` is rejected; pass an array instead.
+  `audience` starting with `[` is rejected; pass an array instead. `MONDO_POLICY_STATEMENT` accepts
+  only `action`, `effect`, and `resource`. Any other key, such as an IAM-style `Effect`, makes the
+  function fail to initialize instead of being ignored.
 - **Signing-key outages.** If refreshing the JWKS fails, the authorizer keeps using the keys it
-  already has instead of failing requests.
+  already has instead of failing requests. If the first fetch of the discovery document or JWKS
+  fails, requests fail without contacting the IdP for 30 seconds before it's retried.
 
 Apps with a custom handler built with `createRestApiAuthorizerHandler` need their callbacks ported
 to Rust as `AuthorizerHooks` methods: `validateClaims` becomes `validate_claims`,
 `buildPolicyStatement` becomes `build_policy_statement`, and `buildAdditionalContext` becomes
 `build_context`. `build_context` receives the assembled context and returns the final one, so
-instead of returning `{ key: undefined }` to drop a key, call `context.remove("key")`. See
+instead of returning `{ key: undefined }` to drop a key, call `context.remove("key")`.
+
+`build_policy_statement` returns a `PolicyStatementOverride`, whose fields are `Option`s.
+`action` and `resource` are lists of strings even when there's a single value, and `effect` is an
+`IamPolicyEffect`:
+
+```diff
+- return { effect: "Deny", resource: methodArn };
++ Ok(PolicyStatementOverride {
++     effect: Some(IamPolicyEffect::Deny),
++     resource: Some(vec![input.method_arn.to_owned()]),
++     ..Default::default()
++ })
+```
+
+The event and response use the standard
+[`aws_lambda_events`](https://docs.rs/aws_lambda_events) types,
+`ApiGatewayCustomAuthorizerRequest` and `ApiGatewayCustomAuthorizerResponse`. They're re-exported
+from `mondo_lambda_authorizer::rest_api`, along with `IamPolicyEffect` and `IamPolicyStatement`,
+so you don't need to add `aws_lambda_events` as a dependency. Those types are `#[non_exhaustive]`,
+so build one from `Default::default()` and set its fields rather than with a struct literal. See
 [Custom Handler](#custom-handler).
 
 ## Development

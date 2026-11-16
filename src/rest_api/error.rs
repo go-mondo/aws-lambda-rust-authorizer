@@ -7,12 +7,17 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 ///
 /// [`Error::Unauthorized`] displays as `Unauthorized`, which API Gateway maps to a 401 response.
 /// Every other variant surfaces as a 500.
+///
+/// New variants may be added in minor releases, so a `match` on this type needs a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("Unauthorized")]
     Unauthorized,
     #[error("{0} is required")]
     MissingEnv(&'static str),
+    #[error("the authorizer event has no methodArn")]
+    MissingMethodArn,
     #[error("{name} contains invalid JSON: {source}")]
     InvalidEnvJson {
         name: &'static str,
@@ -22,12 +27,18 @@ pub enum Error {
     InvalidAudience,
     #[error("OIDC discovery request failed with status {0}")]
     DiscoveryStatus(u16),
+    #[error("OIDC discovery response is not valid JSON")]
+    DiscoveryInvalid,
     #[error("OIDC discovery response is missing issuer or jwks_uri")]
     DiscoveryIncomplete,
+    #[error("OIDC discovery failed recently and is not retried until the cooldown has passed")]
+    DiscoveryCooldown,
     #[error("JWKS request failed with status {0}")]
     JwksStatus(u16),
     #[error("JWKS response is not a valid JSON Web Key Set")]
     JwksInvalid,
+    #[error("JWKS request failed recently and is not retried until the cooldown has passed")]
+    JwksCooldown,
     #[error(transparent)]
     Http(#[from] reqwest::Error),
     #[error(transparent)]

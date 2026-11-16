@@ -1,12 +1,13 @@
 [package]
 name = "mondo-lambda-authorizer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "AWS Lambda Rust authorizers for Mondo Identity."
 repository = "https://github.com/go-mondo/aws-lambda-rust-authorizer"
 readme = "README.md"
 
 [dependencies]
+aws_lambda_events = { version = "1.2.1", default-features = false, features = ["apigw"] }
 jsonwebtoken = { version = "12.0.0", features = ["rust_crypto"], default-features = false }
 lambda_runtime = { version = "1.5.0", default-features = false, features = ["tracing"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }

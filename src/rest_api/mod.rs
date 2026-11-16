@@ -12,6 +12,8 @@ mod error;
 mod policy;
 
 use std::future::Future;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use jsonwebtoken::Validation;
 use lambda_runtime::{LambdaEvent, service_fn};
@@ -24,14 +26,20 @@ pub use claims::{
 };
 pub use config::Config;
 pub use error::{BoxError, Error};
-pub use policy::{
-    AuthorizerResponse, PolicyDocument, PolicyEffect, PolicyStatement, PolicyStatementOverride,
-    StringOrArray, TokenAuthorizerEvent, build_all_methods_resource,
+pub use policy::{AuthorizerResponse, PolicyStatementOverride, build_all_methods_resource};
+
+/// The `aws_lambda_events` types in this module's API, re-exported so a custom handler doesn't need
+/// its own matching version of that crate.
+pub use aws_lambda_events::apigw::{
+    ApiGatewayCustomAuthorizerPolicy, ApiGatewayCustomAuthorizerRequest,
+    ApiGatewayCustomAuthorizerResponse,
 };
+pub use aws_lambda_events::iam::{IamPolicyEffect, IamPolicyStatement};
 
 use claims::safe_claim_log_context;
-use discovery::Discovery;
+use discovery::{DISCOVERY_COOLDOWN, Discovery};
 use error::{error_log_context, unauthorized};
+use policy::build_response;
 
 /// Principal used when a verified token has no `sub` claim.
 const DEFAULT_PRINCIPAL_ID: &str = "mondo-user";
@@ -96,6 +104,7 @@ pub struct Authorizer<H = NoHooks> {
     hooks: H,
     client: reqwest::Client,
     discovery: OnceCell<Discovery>,
+    discovery_failed_at: Mutex<Option<Instant>>,
 }
 
 impl Authorizer {
@@ -105,6 +114,7 @@ impl Authorizer {
             hooks: NoHooks,
             client: reqwest::Client::new(),
             discovery: OnceCell::new(),
+            discovery_failed_at: Mutex::default(),
         }
     }
 
@@ -121,6 +131,7 @@ impl<H: AuthorizerHooks> Authorizer<H> {
             hooks,
             client: self.client,
             discovery: self.discovery,
+            discovery_failed_at: self.discovery_failed_at,
         }
     }
 
@@ -128,6 +139,7 @@ impl<H: AuthorizerHooks> Authorizer<H> {
         Self {
             client,
             discovery: OnceCell::new(),
+            discovery_failed_at: Mutex::default(),
             ..self
         }
     }
@@ -139,7 +151,7 @@ impl<H: AuthorizerHooks> Authorizer<H> {
     /// Authorizes a request. Denied requests return [`Error::Unauthorized`].
     pub async fn authorize(
         &self,
-        event: &TokenAuthorizerEvent,
+        event: &ApiGatewayCustomAuthorizerRequest,
     ) -> Result<AuthorizerResponse, Error> {
         let result = self.try_authorize(event).await;
 
@@ -154,8 +166,10 @@ impl<H: AuthorizerHooks> Authorizer<H> {
 
     async fn try_authorize(
         &self,
-        event: &TokenAuthorizerEvent,
+        event: &ApiGatewayCustomAuthorizerRequest,
     ) -> Result<AuthorizerResponse, Error> {
+        // API Gateway always sends one for a `TOKEN` authorizer.
+        let method_arn = event.method_arn.as_deref().ok_or(Error::MissingMethodArn)?;
         let token = get_bearer_token(event.authorization_token.as_deref())?;
         let claims = self.verify_token(token).await?;
 
@@ -185,17 +199,16 @@ impl<H: AuthorizerHooks> Authorizer<H> {
             self.hooks
                 .build_policy_statement(PolicyInput {
                     claims: &claims,
-                    method_arn: &event.method_arn,
+                    method_arn,
                 })
                 .await
                 .map_err(Error::from_hook)?,
         );
         let principal_id =
             get_claim(&claims, "sub").unwrap_or_else(|| DEFAULT_PRINCIPAL_ID.to_owned());
-        let response =
-            AuthorizerResponse::new(principal_id, &event.method_arn, policy_statement, context);
+        let response = build_response(principal_id, method_arn, policy_statement, context);
 
-        tracing::debug!(method_arn = %event.method_arn, "Authorizer success");
+        tracing::debug!(method_arn, "Authorizer success");
 
         Ok(response)
     }
@@ -241,9 +254,27 @@ impl<H: AuthorizerHooks> Authorizer<H> {
         })
     }
 
+    /// The OIDC discovery document, fetched on first use. After a failed fetch, requests fail
+    /// without retrying until the cooldown has passed, so an unreachable IdP doesn't stall every
+    /// request until it times out.
     async fn discovery(&self) -> Result<&Discovery, Error> {
         self.discovery
-            .get_or_try_init(|| Discovery::fetch(&self.client, self.config.discovery_url()))
+            .get_or_try_init(|| async {
+                if self
+                    .discovery_failed_at
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|failed_at| failed_at.elapsed() < DISCOVERY_COOLDOWN)
+                {
+                    return Err(Error::DiscoveryCooldown);
+                }
+
+                Discovery::fetch(&self.client, &self.config.discovery_url())
+                    .await
+                    .inspect_err(|_| {
+                        *self.discovery_failed_at.lock().unwrap() = Some(Instant::now());
+                    })
+            })
             .await
     }
 }
@@ -305,7 +336,7 @@ pub async fn run<H: AuthorizerHooks>(
     let authorizer = &authorizer;
 
     lambda_runtime::run(service_fn(
-        move |event: LambdaEvent<TokenAuthorizerEvent>| async move {
+        move |event: LambdaEvent<ApiGatewayCustomAuthorizerRequest>| async move {
             authorizer.authorize(&event.payload).await
         },
     ))

@@ -11,6 +11,10 @@ pub type Claims = Map<String, Value>;
 /// API Gateway authorizer context. Values must be strings, numbers, or booleans.
 pub type Context = BTreeMap<String, ScalarValue>;
 
+/// Context keys and the claims they're read from, returned by every Mondo authorizer.
+const DEFAULT_CONTEXT_CLAIMS: [(&str, &str); 3] =
+    [("appId", "azp"), ("tenantId", "tnt"), ("userId", "sub")];
+
 /// A string, number, or boolean, as accepted by API Gateway authorizer context.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -147,22 +151,25 @@ pub fn assert_required_claims(
 
 /// Builds the `tenantId`, `appId`, and `userId` context returned by every Mondo authorizer.
 pub fn build_default_context(claims: &Claims) -> Context {
-    build_mapped_context(
-        claims,
-        &BTreeMap::from([
-            ("appId".to_owned(), "azp".to_owned()),
-            ("tenantId".to_owned(), "tnt".to_owned()),
-            ("userId".to_owned(), "sub".to_owned()),
-        ]),
-    )
+    build_mapped_context(claims, DEFAULT_CONTEXT_CLAIMS)
 }
 
 /// Maps context keys to claim names, skipping claims that are missing or not context-safe.
-pub fn build_mapped_context(claims: &Claims, claim_mappings: &BTreeMap<String, String>) -> Context {
+/// `claim_mappings` can be any `(context key, claim name)` pairs, such as a
+/// `&BTreeMap<String, String>` or an array of `(&str, &str)`.
+pub fn build_mapped_context<K, C>(
+    claims: &Claims,
+    claim_mappings: impl IntoIterator<Item = (K, C)>,
+) -> Context
+where
+    K: AsRef<str>,
+    C: AsRef<str>,
+{
     claim_mappings
-        .iter()
+        .into_iter()
         .filter_map(|(context_key, claim_name)| {
-            get_claim(claims, claim_name).map(|value| (context_key.clone(), value.into()))
+            get_claim(claims, claim_name.as_ref())
+                .map(|value| (context_key.as_ref().to_owned(), value.into()))
         })
         .collect()
 }
